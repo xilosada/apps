@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@calimero-network/mero-js": "^19.10.0",
+    "@calimero-network/mero-js": "file:/Users/xilosada/dev/calimero-work/mero-js-signer",
     "react": "catalog:",
     "react-dom": "catalog:"
   },
