@@ -139,6 +139,13 @@ export interface Settings {
   admitUrl: string;
   /** Resolved by discovery, not typed: the chosen admitter's base URL. */
   nodeUrl: string;
+  /**
+   * The certificate cloud that signs this device's certificate.
+   *
+   * See {@link DEFAULT_CERT_CLOUD} — a different thing from
+   * {@link Settings.portalUrl}, which is where a person signs in.
+   */
+  certCloudUrl: string;
 }
 
 /**
@@ -151,6 +158,16 @@ export interface Settings {
  */
 export const DEFAULT_CLOUD_URL = 'https://manager.cloud.calimero.network';
 export const DEFAULT_PORTAL_URL = 'https://cloud.calimero.network';
+
+/**
+ * The certificate cloud — the only party that issues device certificates.
+ *
+ * Distinct from {@link Settings.portalUrl}, which is where a person signs in to
+ * the Calimero cloud. This one holds the account roots and signs a device
+ * certificate once a security key has authorised it for a specific device key
+ * and origin.
+ */
+export const DEFAULT_CERT_CLOUD = 'http://localhost:8090';
 
 /**
  * A fresh page's settings: blank everywhere the value is specific to one
@@ -171,6 +188,7 @@ export const DEFAULT_SETTINGS: Settings = {
   nodeUrl: '',
   relayUrl: '',
   admitUrl: '',
+  certCloudUrl: DEFAULT_CERT_CLOUD,
 };
 
 /** Read JSON from `localStorage`, treating any failure as absence. */

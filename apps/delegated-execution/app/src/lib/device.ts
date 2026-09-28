@@ -25,6 +25,8 @@
  * just to use it.
  */
 
+import { signerFromCryptoKey, type Signer } from '@calimero-network/mero-js';
+
 const DB_NAME = 'calimero.delegated-demo';
 const STORE = 'kv';
 const DEVICE_KEY = 'device.key';
@@ -56,10 +58,32 @@ export interface DeviceHandle {
    * group key — it reads through a session and writes through a relay, both of
    * which hold the key material. The X25519 half is generated anyway, because
    * substituting a placeholder produces a certificate that verifies today and
-   * strands the device the moment anyone tries to deliver it a key. Its private
-   * half is deliberately dropped: holding a secret nothing reads is a liability.
+   * strands the device the moment anyone tries to deliver it a key.
    */
   kemPublicKey: string;
+  /**
+   * The X25519 private half, non-extractable.
+   *
+   * Kept now, where it used to be dropped as "a secret nothing reads". The
+   * portal enrolment flow reads it: the confirmation code you type is checked
+   * against an X25519 secret derived between this key and the approver's
+   * ephemeral key, so **only this page can check the code**. That is what stops
+   * a mailbox choosing which approval you accept — and it only works if the
+   * private half survives.
+   *
+   * Optional because a device enrolled before this field existed does not have
+   * one. Such a device still signs, reads and writes; it simply cannot do a
+   * portal enrolment, and the panel says so rather than failing obscurely.
+   */
+  kemPrivateKey?: CryptoKey;
+  /**
+   * 16 random bytes, hex, fixed at generation.
+   *
+   * Covers the `DeviceId` the account root mints for this device, so the same
+   * browser asking twice is recognisably the same device rather than a second
+   * one. Optional for the same reason as {@link DeviceHandle.kemPrivateKey}.
+   */
+  deviceNonce?: string;
 }
 
 export class UnsupportedBrowserError extends Error {
@@ -123,7 +147,9 @@ export async function deviceHandle(): Promise<DeviceHandle> {
 
   let kem: CryptoKeyPair;
   try {
-    kem = (await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits'])) as CryptoKeyPair;
+    // `extractable: false` on the delivery key too. The private half is used —
+    // see `kemPrivateKey` — but only through `deriveBits`, never read.
+    kem = (await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits'])) as CryptoKeyPair;
   } catch {
     throw new UnsupportedBrowserError('X25519');
   }
@@ -133,6 +159,8 @@ export async function deviceHandle(): Promise<DeviceHandle> {
     signingKey: pair.privateKey,
     devicePublicKey: hex(raw),
     kemPublicKey: hex(kemRaw),
+    kemPrivateKey: kem.privateKey,
+    deviceNonce: hex(crypto.getRandomValues(new Uint8Array(16))),
   };
   await idb('readwrite', (s) => s.put(handle, DEVICE_KEY));
   return handle;
@@ -157,6 +185,22 @@ export async function recordEnrollment(device: EnrolledDevice): Promise<void> {
     throw new Error('that credential certifies a different device key than this browser holds');
   }
   await idb('readwrite', (s) => s.put(device, DEVICE_META));
+}
+
+/**
+ * The handle as something mero-js can sign with.
+ *
+ * This is the seam the whole app turns on. mero-js used to take 32 hex bytes
+ * everywhere, so a key that cannot be exported could not be used with it at all
+ * — and this app carried its own copies of core's warrant and login-statement
+ * encodings to work around that. `Signer` removes the reason for those copies:
+ * the library does the bytes, this module supplies a key it cannot read.
+ *
+ * The public half is passed explicitly because a non-extractable private key
+ * cannot produce it — it was captured when the key was generated.
+ */
+export async function deviceSigner(handle: DeviceHandle): Promise<Signer> {
+  return signerFromCryptoKey(handle.signingKey, handle.devicePublicKey);
 }
 
 /** Forget the device entirely — the key included, since it cannot be re-derived. */

@@ -174,7 +174,7 @@ export function App() {
       <CustodyToggle custody={custody} onChoose={chooseCustody} />
 
       {custody === 'offline' ? (
-        <HardenedPath startAt={2} settings={settings} />
+        <HardenedPath startAt={2} settings={settings} onChange={updateSettings} />
       ) : (
         <>
       <IdentityStep

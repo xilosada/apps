@@ -34,15 +34,23 @@ import { useCallback, useEffect, useState } from 'react';
 import { Out, Step } from './Step.js';
 import {
   deviceHandle,
+  deviceSigner,
   enrolled,
   forgetDevice,
   recordEnrollment,
   type DeviceHandle,
   type EnrolledDevice,
 } from '../lib/device.js';
-import { openSession, type DelegatedSession } from '../lib/login.js';
-import { describeRelay, writeContext } from '../lib/relay.js';
+import {
+  RelayClient,
+  createLocalStorageNonceSource,
+  login,
+  type DelegatedSession,
+} from '@calimero-network/mero-js';
 import { readContext } from '../lib/flow.js';
+import { joinNamespace } from '../lib/join.js';
+import { beginCloudEnrol, readEnrolCallback } from '../lib/certCloud.js';
+import { DEFAULT_CERT_CLOUD } from '../lib/storage.js';
 import { errorText, parseJson, pretty, short } from '../lib/format.js';
 import type { Settings } from '../lib/storage.js';
 
@@ -68,9 +76,12 @@ function useOutcome() {
 
 export function HardenedPath({
   settings,
+  onChange,
   startAt,
 }: {
   settings: Settings;
+  /** Needed by enrolment: the Auth mailbox is a setting a person types. */
+  onChange: (patch: Partial<Settings>) => void;
   /**
    * The number of this path's first panel. Passed in rather than hardcoded so
    * the two custody paths can both start from 2, under a shared step 1 — the
@@ -94,6 +105,8 @@ export function HardenedPath({
     <>
       <EnrollStep
         n={startAt}
+        settings={settings}
+        onChange={onChange}
         handle={handle}
         device={device}
         onHandle={setHandle}
@@ -110,8 +123,16 @@ export function HardenedPath({
           setSession(null);
         }}
       />
-      <HardenedSessionStep
+      <HardenedJoinStep
         n={startAt + 1}
+        settings={settings}
+        onChange={onChange}
+        device={device}
+        handle={handle}
+        onHandle={setHandle}
+      />
+      <HardenedSessionStep
+        n={startAt + 2}
         settings={settings}
         device={device}
         handle={handle}
@@ -119,9 +140,9 @@ export function HardenedPath({
         onSession={setSession}
         onHandle={setHandle}
       />
-      <HardenedReadStep n={startAt + 2} settings={settings} session={session} />
+      <HardenedReadStep n={startAt + 3} settings={settings} session={session} />
       <HardenedWriteStep
-        n={startAt + 3}
+        n={startAt + 4}
         settings={settings}
         device={device}
         handle={handle}
@@ -142,6 +163,8 @@ export function HardenedPath({
  */
 function EnrollStep({
   n,
+  settings,
+  onChange,
   handle,
   device,
   onHandle,
@@ -149,6 +172,8 @@ function EnrollStep({
   onForget,
 }: {
   n: number;
+  settings: Settings;
+  onChange: (patch: Partial<Settings>) => void;
   handle: DeviceHandle | null;
   device: EnrolledDevice | null;
   onHandle: (handle: DeviceHandle) => void;
@@ -159,6 +184,45 @@ function EnrollStep({
   const [credential, setCredential] = useState('');
   const [accountId, setAccountId] = useState('');
   const [deviceId, setDeviceId] = useState('');
+  const [callback, setCallback] = useState<{ text: string; error: boolean } | null>(null);
+
+  // The cloud returns through a fresh page load, so the answer is in the URL
+  // rather than in anything this component remembers. Mount only: an answer is
+  // read once, and the fragment is stripped as it is read.
+  useEffect(() => {
+    let grant;
+    try {
+      grant = readEnrolCallback();
+    } catch (err) {
+      setCallback({ text: errorText(err), error: true });
+      return;
+    }
+    if (!grant) return;
+    void (async () => {
+      try {
+        const key = await deviceHandle();
+        const next: EnrolledDevice = {
+          accountId: grant.accountId,
+          deviceId: grant.deviceId,
+          devicePublicKey: key.devicePublicKey,
+          credential: grant.credential,
+        };
+        // Refuses a credential for a different key — the same guard the paste
+        // path uses, and it matters more here because the round trip is longer.
+        await recordEnrollment(next);
+        onDevice(next);
+        setCallback({
+          text: `enrolled ${short(grant.accountId, 10)} — ${grant.credential.length / 2} bytes, signed by the cloud`,
+          error: false,
+        });
+      } catch (err) {
+        setCallback({ text: errorText(err), error: true });
+      }
+    })();
+    // Mount only: `onDevice` is stable for this panel's lifetime and re-running
+    // would re-read a fragment that has already been consumed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <Step
@@ -215,12 +279,56 @@ function EnrollStep({
         ) : null}
       </div>
 
+      <h3>Certify it with your security key</h3>
+      <p className="aside">
+        The cloud signs, and a <strong>YubiKey or platform passkey</strong> authorises it.
+        The challenge your authenticator signs is{' '}
+        <code>SHA-256(nonce ‖ device_key ‖ origin)</code>, so one touch authorises{' '}
+        <strong>one key for one app</strong> rather than a session — which is why a stolen
+        cloud session cannot have a certificate minted for someone else&rsquo;s key.
+      </p>
+
+      <label>
+        Certificate cloud
+        <input
+          type="text"
+          value={settings.certCloudUrl}
+          placeholder={DEFAULT_CERT_CLOUD}
+          onChange={(e) => onChange({ certCloudUrl: e.target.value.trim() })}
+        />
+      </label>
+
+      <div className="row">
+        <button
+          disabled={busy}
+          onClick={() =>
+            void run(async () => {
+              const key = handle ?? (await deviceHandle());
+              if (!handle) onHandle(key);
+              // Navigates away. The answer arrives on a later load and is
+              // picked up by the effect below.
+              await beginCloudEnrol(settings.certCloudUrl, key);
+              return 'handing you to the cloud to approve…';
+            })
+          }
+        >
+          Certify with my security key
+        </button>
+      </div>
+      <p className="aside">
+        The cloud requires an <strong>active app certificate</strong> for this origin, which
+        it reads from the <code>Origin</code> header rather than from anything this page
+        says. Publish one with the publisher CLI before enrolling, or it refuses.
+      </p>
+
+      <h3>Or certify it offline, with a root in a file</h3>
       {handle ? (
         <>
           <p className="aside">
-            Run this where the account root is. It mints a <code>DeviceId</code>, signs a{' '}
-            <code>DeviceCert</code> and prints the <code>AccountProof</code> to paste back —
-            the root never touches this machine’s browser:
+            The same ceremony with the root in a file rather than in hardware — a stand-in
+            for Calimero Auth, useful when you have no Mac or phone to hand. It mints a{' '}
+            <code>DeviceId</code>, signs a <code>DeviceCert</code> and prints the{' '}
+            <code>AccountProof</code> to paste back:
           </p>
           <pre className="phrase">
             {`certifier certify --key account.key \\\n  --device-key ${handle.devicePublicKey} \\\n  --kem-key ${handle.kemPublicKey}`}
@@ -275,6 +383,108 @@ function EnrollStep({
           <dd>{short(device.deviceId, 12)}</dd>
         </dl>
       ) : null}
+
+      <Out error={outcome?.error ?? callback?.error}>
+        {outcome?.text ?? callback?.text ?? ''}
+      </Out>
+    </Step>
+  );
+}
+
+/**
+ * Claim an invitation — the one governance op a keyholder signs for itself.
+ *
+ * This replaces an operator adding the account through the node's admin API.
+ * Both are legitimate (`MemberAdded` is admin-signed by design) but only this
+ * one shows a keyholder joining *by its own authority*, which is the thing
+ * worth demonstrating: the admitter carries the op and cannot alter who joined.
+ */
+function HardenedJoinStep({
+  n,
+  settings,
+  onChange,
+  device,
+  handle,
+  onHandle,
+}: {
+  n: number;
+  settings: Settings;
+  onChange: (patch: Partial<Settings>) => void;
+  device: EnrolledDevice | null;
+  handle: DeviceHandle | null;
+  onHandle: (handle: DeviceHandle) => void;
+}) {
+  const { outcome, busy, run } = useOutcome();
+  const [joined, setJoined] = useState(false);
+
+  return (
+    <Step
+      n={n}
+      title="Claim an invitation with your own key"
+      state={joined ? 'done' : 'idle'}
+      stateLabel={joined ? 'sent' : 'not yet'}
+      why={
+        <>
+          Your device signs the membership op and an <strong>admitter</strong> only carries it.
+          Every peer checks the op&rsquo;s signer against the certificate inside it, so the node
+          relaying it cannot admit a different account, change the group or grant itself a role
+          — and core lets a designated admitter carry <em>only a join</em>, never governance at
+          large. Its whole power is to refuse.
+        </>
+      }
+    >
+      <label>
+        Namespace id — 64 hex
+        <input
+          type="text"
+          value={settings.namespaceId}
+          placeholder="89ab…"
+          onChange={(e) => onChange({ namespaceId: e.target.value.trim() })}
+        />
+      </label>
+      <label>
+        Invitation — exactly as the operator&rsquo;s node printed it
+        <textarea
+          rows={4}
+          value={settings.invitationJson}
+          placeholder={'{"invitation": {"admitters": ["…"]}, "inviter_signature": "…"}'}
+          onChange={(e) => onChange({ invitationJson: e.target.value })}
+        />
+      </label>
+      <p className="aside">
+        The invitation is a <strong>bearer</strong> capability: it names who may
+        <em> admit</em> a claim, not who may join, so anyone holding it can claim it. It is sent
+        to the node URL above, which has to be one of the admitters its signed body lists.
+      </p>
+
+      <div className="row">
+        <button
+          disabled={busy || !device || settings.namespaceId.trim().length !== 64 || settings.invitationJson.trim() === ''}
+          onClick={() =>
+            void run(async () => {
+              if (!device) throw new Error('enrol a device first');
+              const key = handle ?? (await deviceHandle());
+              if (!handle) onHandle(key);
+              const { published } = await joinNamespace(
+                settings.nodeUrl,
+                settings.namespaceId,
+                settings.invitationJson,
+                device,
+                key,
+              );
+              setJoined(published);
+              return published
+                ? 'signed and published. The admitter carried it; membership lands when peers ' +
+                    'fold the op, so the read is what confirms it — a 403 immediately after is ' +
+                    'usually that race rather than a refusal.'
+                : 'the admitter accepted the call but reported nothing published. Treat that as ' +
+                    'not joined and try another admitter.';
+            })
+          }
+        >
+          Sign and send my join
+        </button>
+      </div>
 
       <Out error={outcome?.error}>{outcome?.text ?? ''}</Out>
     </Step>
@@ -337,7 +547,17 @@ function HardenedSessionStep({
               // record loads from IndexedDB on mount, the key itself does not.
               const key = handle ?? (await deviceHandle());
               if (!handle) onHandle(key);
-              const opened = await openSession(settings.nodeUrl, settings.nodeKey, device, key);
+              // mero-js does the whole exchange — challenge, statement, token —
+              // and signs through a key it cannot read. Before `Signer` existed
+              // this had to be reimplemented here, because every entry point
+              // took the secret as hex.
+              const opened = await login({
+                nodeUrl: settings.nodeUrl,
+                node: settings.nodeKey,
+                signer: await deviceSigner(key),
+                accountProof: device.credential,
+                audience: { kind: 'webOrigin', origin: window.location.origin },
+              });
               onSession(opened);
               return 'session minted from a statement signed by an unexportable key';
             })
@@ -470,7 +690,15 @@ function HardenedWriteStep({
           disabled={busy || writeUrl === ''}
           onClick={() =>
             void run(async () => {
-              const described = await describeRelay(writeUrl, settings.contextId);
+              // `describe` signs nothing and spends no nonce, so the author
+              // fields are placeholders it never reads.
+              const described = await new RelayClient({
+                relayUrl: writeUrl,
+                authorAccount: '',
+                authorProof: '',
+                deviceSecret: '',
+                nonces: { next: () => Promise.resolve(0n) },
+              }).describe(settings.contextId);
               return described.canAuthorOnBehalf
                 ? `this node may author on your behalf.\nexecutor: ${described.executorAccount}`
                 : `this node may NOT author on your behalf yet.\nexecutor: ${described.executorAccount}\n\n` +
@@ -489,14 +717,16 @@ function HardenedWriteStep({
               if (parsed.error !== null) throw new Error(parsed.error);
               const key = handle ?? (await deviceHandle());
               if (!handle) onHandle(key);
-              const result = await writeContext(
-                writeUrl,
-                device,
-                key,
-                settings.contextId,
-                'set',
-                parsed.value,
-              );
+              const relay = new RelayClient({
+                relayUrl: writeUrl,
+                authorAccount: device.accountId,
+                authorProof: device.credential,
+                signer: await deviceSigner(key),
+                nonces: createLocalStorageNonceSource(
+                  `calimero.warrant.nonce.${device.devicePublicKey}`,
+                ),
+              });
+              const result = await relay.execute(settings.contextId, 'set', parsed.value);
               return `accepted.\nrootHash: ${result.rootHash}\nreturns:  ${pretty(result.returns)}`;
             })
           }
